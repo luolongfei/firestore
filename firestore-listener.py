@@ -5,6 +5,12 @@
 @author mybsdc <mybsdc@gmail.com>
 @date 2020/10/12
 @time 15:05
+
+@issues
+    https://github.com/googleapis/python-firestore/issues/18
+    https://github.com/firebase/firebase-admin-python/issues/294
+    https://github.com/firebase/firebase-admin-python/issues/282
+    https://stackoverflow.com/questions/55876107/how-to-detect-realtime-listener-errors-in-firebase-firestore-database
 """
 
 import os
@@ -12,12 +18,15 @@ import argparse
 import sys
 import json
 import base64
+import time
+import datetime
 import traceback
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from google.cloud import firestore
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 from loguru import logger
+import logging
 
 
 def catch_exception(origin_func):
@@ -40,6 +49,7 @@ def catch_exception(origin_func):
 
 
 class FirestoreListener(object):
+    @logger.catch
     def __init__(self):
         FirestoreListener.check_py_version()
 
@@ -47,20 +57,35 @@ class FirestoreListener(object):
         self.args = self.get_all_args()
 
         # 日志
+        self.__logger_setting()
+
+        # Firestore 日志：由于 firestore 的异常和日志是在它自己的子进程中处理的，外层无法捕获错误信息，但是 firestore 使用了 logging 模块写日志，故可将日志记录在文件中
+        logging.basicConfig(filename='logs/firestore.log', level=logging.DEBUG if self.args.debug else logging.INFO,
+                            format='[%(asctime)s] %(levelname)s | %(process)d:%(filename)s:%(name)s:%(lineno)d:%(module)s - %(message)s')
+
+        # firestore 数据库配置
+        self.collection_id = self.args.collection_id
+        self.col_watch = None
+
+        self.is_first_time = True
+        self.today = FirestoreListener.today()
+
+        # 线程池
+        self.max_workers = self.args.max_workers
+        self.thread_pool_executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
+    @staticmethod
+    def today():
+        return str(datetime.date.today())
+
+    def __logger_setting(self) -> None:
         logger.remove()
         logger.add('logs/{time:YYYY-MM-DD}.log', filter=FirestoreListener.no_debug_log, encoding='utf-8')
         logger.add(sys.stderr, colorize=True, level='DEBUG' if self.args.debug else 'INFO',
                    format='<green>[{time:YYYY-MM-DD HH:mm:ss.SSS}]</green> <b><level>{level: <8}</level></b> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>')
 
-        # 初始化 firestore 数据库
-        self.db = firestore.Client.from_service_account_json(self.args.key_path)
-        self.collection_id = self.args.collection_id
-
-        self.is_first_time = True
-
-        # 线程池
-        self.max_workers = self.args.max_workers
-        self.thread_pool_executor = ThreadPoolExecutor(max_workers=self.max_workers)
+    def __get_db(self):
+        return firestore.Client.from_service_account_json(self.args.key_path)
 
     @staticmethod
     def no_debug_log(record: dict) -> bool:
@@ -84,7 +109,7 @@ class FirestoreListener(object):
         parser.add_argument('-k', '--key_path',
                             help='由谷歌提供的 json 格式的密钥文件的路径，更多信息参考：https://googleapis.dev/python/google-api-core/latest/auth.html',
                             required=True, type=str)
-        parser.add_argument('-mw', '--max_workers', help='最大线程数（在执行外部 php 命令时）', default=20, type=int)
+        parser.add_argument('-mw', '--max_workers', help='最大线程数（在执行外部 php 命令时）', default=1, type=int)
         parser.add_argument('-d', '--debug', help='是否开启 Debug 模式', action='store_true')
 
         return parser.parse_args()
@@ -114,7 +139,22 @@ class FirestoreListener(object):
         except Exception as e:
             logger.error('构造外部命令出错：{}', str(e))
 
+    @logger.catch
     def __on_snapshot(self, col_snapshot, changes, read_time) -> None:
+        """
+        Firestore 回调
+        新增文档时触发执行外部命令
+        :param col_snapshot:
+        :param changes:
+        :param read_time:
+        :return:
+        """
+        # 常驻执行，更新日志目录
+        real_today = FirestoreListener.today()
+        if self.today != real_today:
+            self.today = real_today
+            self.__logger_setting()
+
         for change in changes:
             if change.type.name == 'ADDED':
                 if self.is_first_time:
@@ -131,50 +171,37 @@ class FirestoreListener(object):
             elif change.type.name == 'REMOVED':
                 logger.debug('移除快照或文档 ID: {} 内容: {}', change.document.id, change.document.to_dict())
 
+    @logger.catch
+    def __start_snapshot(self):
+        self.col_watch = self.__get_db().collection(self.collection_id).order_by('updatedAt',
+                                                                                 direction=firestore.Query.DESCENDING).limit(
+            1).on_snapshot(self.__on_snapshot)
+
+    @logger.catch
     def __listen_for_changes(self) -> None:
         """
         监听文档变化
         on_snapshot 方法在每次新增文档时候，会移除旧的快照，创建新的快照
         :return:
         """
-        col_ref = self.db.collection(self.collection_id).order_by('updatedAt',
-                                                                  direction=firestore.Query.DESCENDING).limit(1)
-        col_watch = col_ref.on_snapshot(self.__on_snapshot)
+        self.__start_snapshot()
 
-    @staticmethod
-    def time_diff(start_time, end_time):
-        """
-        计算时间间隔
-        :param start_time: 开始时间戳
-        :param end_time: 结束时间戳
-        :return:
-        """
-        diff_time = end_time - start_time
+        while True:
+            if self.col_watch._closed:
+                logger.error('检测到 firestore 很不仗义的罢工了，将尝试重启')
 
-        if diff_time < 0:
-            raise ValueError('结束时间必须大于等于开始时间')
+                try:
+                    self.__start_snapshot()
 
-        if diff_time < 60:
-            return '{:.2f}秒'.format(diff_time)
-        else:
-            diff_time = int(diff_time)
+                    # 防止异常导致宕机
+                    time.sleep(0.001)
+                except Exception as e:
+                    logger.error('重启失败：{}', str(e))
+                    break
 
-        if 60 <= diff_time < 3600:
-            m, s = divmod(diff_time, 60)
+            time.sleep(0.001)
 
-            return '{:02d}分钟{:02d}秒'.format(m, s)
-        elif 3600 <= diff_time < 24 * 3600:
-            m, s = divmod(diff_time, 60)
-            h, m = divmod(m, 60)
-
-            return '{:02d}小时{:02d}分钟{:02d}秒'.format(h, m, s)
-        elif 24 * 3600 <= diff_time:
-            m, s = divmod(diff_time, 60)
-            h, m = divmod(m, 60)
-            d, h = divmod(h, 24)
-
-            return '{:02d}天{:02d}小时{:02d}分钟{:02d}秒'.format(d, h, m, s)
-
+    @logger.catch
     @catch_exception
     def run(self):
         self.__listen_for_changes()
