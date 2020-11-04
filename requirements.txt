@@ -1,2 +1,2 @@
 loguru==0.5.3
-google-cloud-firestore==1.9.0
+google-cloud-firestore==v2.0.0-dev2

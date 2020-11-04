@@ -80,20 +80,19 @@ class FirestoreListener(object):
 
     def __logger_setting(self) -> None:
         logger.remove()
-        logger.add('logs/{time:YYYY-MM-DD}.log', filter=FirestoreListener.no_debug_log, encoding='utf-8')
-        logger.add(sys.stderr, colorize=True, level='DEBUG' if self.args.debug else 'INFO',
-                   format='<green>[{time:YYYY-MM-DD HH:mm:ss.SSS}]</green> <b><level>{level: <8}</level></b> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>')
+
+        level = 'DEBUG' if self.args.debug else 'INFO'
+        format = '<green>[{time:YYYY-MM-DD HH:mm:ss.SSS}]</green> <b><level>{level: <8}</level></b> | <cyan>{process.id}</cyan>:<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'
+
+        logger.add('logs/{time:YYYY-MM-DD}.log', level=level, format=format, encoding='utf-8')
+        logger.add(sys.stderr, colorize=True, level=level, format=format)
 
     def __get_db(self):
         return firestore.Client.from_service_account_json(self.args.key_path)
 
     @staticmethod
-    def no_debug_log(record: dict) -> bool:
-        return record['level'].name != 'DEBUG'
-
-    @staticmethod
     def check_py_version(major=3, minor=6):
-        if sys.version_info.major != major or sys.version_info.minor < minor:
+        if sys.version_info < (major, minor):
             raise UserWarning(f'请使用 python {major}.{minor} 及以上版本，推荐使用 python 3.8')
 
     @staticmethod
@@ -194,7 +193,7 @@ class FirestoreListener(object):
                     self.__start_snapshot()
 
                     # 防止异常导致宕机
-                    time.sleep(0.001)
+                    time.sleep(0.01)
                 except Exception as e:
                     logger.error('重启失败：{}', str(e))
                     break
