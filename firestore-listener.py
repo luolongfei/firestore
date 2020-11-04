@@ -11,6 +11,7 @@
     https://github.com/firebase/firebase-admin-python/issues/294
     https://github.com/firebase/firebase-admin-python/issues/282
     https://stackoverflow.com/questions/55876107/how-to-detect-realtime-listener-errors-in-firebase-firestore-database
+    https://uyamazak.hatenablog.com/entry/2019/07/09/221041
 """
 
 import os
@@ -21,10 +22,10 @@ import base64
 import time
 import datetime
 import traceback
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from google.cloud import firestore
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+from google.api_core.exceptions import GoogleAPIError
 from loguru import logger
 import logging
 
@@ -40,6 +41,8 @@ def catch_exception(origin_func):
             return origin_func(self, *args, **kwargs)
         except AssertionError as e:
             logger.error('参数错误：{}', str(e))
+        except GoogleAPIError as e:
+            logger.error('GoogleAPIError: ', str(e))
         except Exception as e:
             logger.error('出错：{} 位置：{}', str(e), traceback.format_exc())
         finally:
@@ -193,7 +196,7 @@ class FirestoreListener(object):
                     self.__start_snapshot()
 
                     # 防止异常导致宕机
-                    time.sleep(0.01)
+                    time.sleep(1)
                 except Exception as e:
                     logger.error('重启失败：{}', str(e))
                     break
