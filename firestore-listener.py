@@ -22,10 +22,12 @@ import base64
 import time
 import datetime
 import traceback
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from google.cloud import firestore
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 from google.api_core.exceptions import GoogleAPIError
+from google.cloud.firestore_v1.watch import Watch
 from loguru import logger
 import logging
 
@@ -67,8 +69,14 @@ class FirestoreListener(object):
                             format='[%(asctime)s] %(levelname)s | %(process)d:%(filename)s:%(name)s:%(lineno)d:%(module)s - %(message)s')
 
         # firestore 数据库配置
+        self.db = firestore.Client.from_service_account_json(self.args.key_path)
         self.collection_id = self.args.collection_id
-        self.col_watch = None
+        self.restart_interval = self.args.restart_interval
+        self.doc_ref = None
+        self.doc_watch = None
+
+        # Create an Event for notifying main thread
+        self.callback_done = threading.Event()
 
         self.is_first_time = True
         self.today = FirestoreListener.today()
@@ -90,9 +98,6 @@ class FirestoreListener(object):
         logger.add('logs/{time:YYYY-MM-DD}.log', level=level, format=format, encoding='utf-8')
         logger.add(sys.stderr, colorize=True, level=level, format=format)
 
-    def __get_db(self):
-        return firestore.Client.from_service_account_json(self.args.key_path)
-
     @staticmethod
     def check_py_version(major=3, minor=6):
         if sys.version_info < (major, minor):
@@ -113,6 +118,7 @@ class FirestoreListener(object):
                             required=True, type=str)
         parser.add_argument('-mw', '--max_workers', help='最大线程数（在执行外部 php 命令时）', default=1, type=int)
         parser.add_argument('-d', '--debug', help='是否开启 Debug 模式', action='store_true')
+        parser.add_argument('-r', '--restart_interval', help='重启间隔，每隔指定分钟后重启监听动作。单位：分钟', default=20, type=int)
 
         return parser.parse_args()
 
@@ -173,11 +179,21 @@ class FirestoreListener(object):
             elif change.type.name == 'REMOVED':
                 logger.debug('移除快照或文档 ID: {} 内容: {}', change.document.id, change.document.to_dict())
 
+        # 通知主线程，当前线程已经完事儿了，防止阻塞
+        self.callback_done.set()
+
     @logger.catch
-    def __start_snapshot(self):
-        self.col_watch = self.__get_db().collection(self.collection_id).order_by('updatedAt',
-                                                                                 direction=firestore.Query.DESCENDING).limit(
-            1).on_snapshot(self.__on_snapshot)
+    def __start_snapshot(self, force=False):
+        isinstance(self.doc_watch, Watch) and self.doc_watch.unsubscribe()
+
+        self.doc_ref = self.db.collection(self.collection_id).order_by('updatedAt',
+                                                                       direction=firestore.Query.DESCENDING).limit(1)
+
+        # 强行重启时防止重复触发回调
+        if force:
+            self.is_first_time = True
+
+        self.doc_watch = self.doc_ref.on_snapshot(self.__on_snapshot)
 
     @logger.catch
     def __listen_for_changes(self) -> None:
@@ -186,19 +202,31 @@ class FirestoreListener(object):
         on_snapshot 方法在每次新增文档时候，会移除旧的快照，创建新的快照
         :return:
         """
+        logger.debug(f'开始实时监听，每隔 {self.restart_interval} 分钟将自动重启监听动作')
+
+        start_time = time.time()
         self.__start_snapshot()
 
         while True:
-            if self.col_watch._closed:
+            if time.time() - int(self.restart_interval) * 60 > start_time:
+                logger.debug('重启监听')
+
+                self.__start_snapshot(force=True)
+                start_time = time.time()
+
+                continue
+
+            if self.doc_watch._closed:
                 logger.error('检测到 firestore 很不仗义的罢工了，将尝试重启')
 
                 try:
-                    self.__start_snapshot()
+                    self.__start_snapshot(force=True)
 
                     # 防止异常导致宕机
                     time.sleep(1)
                 except Exception as e:
                     logger.error('重启失败：{}', str(e))
+
                     break
 
             time.sleep(0.001)
